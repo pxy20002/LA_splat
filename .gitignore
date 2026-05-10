@@ -1,0 +1,33 @@
+# Third-party sub-projects (clone separately)
+map-anything/
+gaussianwm/
+
+# Large output files
+test/outputs/
+temp/reproduce_outputs/
+anchorsplat/outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary
+*.pt
+*.pth
+checkpoints/
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
