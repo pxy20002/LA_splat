@@ -32,7 +32,7 @@ def farthest_point_sampling(points: torch.Tensor, num_samples: int) -> torch.Ten
     distances = torch.full((N,), torch.inf, device=points.device, dtype=points.dtype)
     indices = torch.zeros(num_samples, dtype=torch.long, device=points.device)
 
-    farthest = torch.randint(0, N, (1,), device=points.device).item()
+    farthest = 0  # deterministic start (not random)
 
     for i in range(num_samples):
         indices[i] = farthest

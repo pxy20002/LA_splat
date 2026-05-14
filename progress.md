@@ -29,6 +29,25 @@
 - **涉及文件**: `test/run_mapanything.py`
 - **备注**: 官方 demo 用的是 `from_pretrained()`，Hydra config 路径下未指定 checkpoint 导致 `pretrained_checkpoint_path=None`
 
+### 2026-05-11 — 模块 2a: Plücker 射线嵌入
+- **内容**: 实现 `anchorsplat/ray_embeddings.py`：从相机内参和外参计算 6 通道 Plücker 坐标（direction(3) + moment(3)）
+- **涉及文件**: `anchorsplat/ray_embeddings.py`, `test/test_ray_embeddings.py`
+- **备注**: 
+  - 支持多种可视化模式（单张/slideshow/批量），支持多种 colormap（默认 jet 匹配论文）
+  - 可选保存 `[10, H, W]` U-Net 输入张量供下游使用
+
+### 2026-05-11 — 模块 2b: 2D U-Net 特征提取器
+- **内容**: 实现 `anchorsplat/unet.py`：4 级编码器-解码器，输入 [B,10,H,W] → 输出 [B,64,H,W] 特征图
+- **涉及文件**: `anchorsplat/unet.py`, `test/test_unet.py`
+- **备注**: ~4.8M 参数，双线性上采样 + 跳跃连接，输出特征可视化通过（非全零/非全常数）
+
+### 2026-05-11 — 模块 3: 特征投影模块
+- **内容**: 实现 `anchorsplat/feature_projector.py`：3D锚点→相机投影→可见性检查（边界/前方/深度一致性）→bilinear 特征采样→多视角 average pooling
+- **涉及文件**: `anchorsplat/feature_projector.py`, `test/test_feature_projector.py`
+- **备注**: 
+  - 深度一致性检查用 `||P_cam||`（射线距离）而非 `z_cam`（此前 bug 导致 97% 锚点被判不可见）
+  - 合成场景测试 + 可见性过滤测试 + 真实数据集成测试全通过，63% 锚点可见
+
 ---
 
 ## 进行中
@@ -39,9 +58,18 @@ _(暂无)_
 
 ## 待办
 
-1. ~~Anchor Predictor~~ ✅ 已完成
-2. 2D U-Net 特征提取器
-3. 特征投影模块
-4. Gaussian Decoder
+1. ~~Anchor Predictor~~ ✅
+2. ~~2D U-Net 特征提取器~~ ✅
+### 2026-05-11 — 模块 4: Gaussian Decoder
+- **内容**: 实现 `anchorsplat/gaussian_decoder.py`：16 层 Global Attention Transformer (640 dim, 10 heads) + 2 个单层 MLP + 5 个并行预测头，~79.7M 参数（论文 ~84M）
+- **涉及文件**: `anchorsplat/gaussian_decoder.py`, `test/test_gaussian_decoder.py`
+- **备注**: 
+  - Attention 使用 PyTorch SDPA（自动调用 FlashAttention-2，H100 等效论文 Ascend Flash Attention）
+  - 每锚点预测 4 个高斯球，5 个属性：δμ, α, s, r, sh(degree=0)
+  - 约束：opacity(sigmoid), scale(exp), rotation(L2 normalize)
+  - 5 项测试全通过（形状/值域/batch/梯度/端到端）
+
+3. ~~特征投影模块~~ ✅
+4. ~~Gaussian Decoder~~ ✅
 5. 可微渲染 + 损失函数
 6. 训练管道

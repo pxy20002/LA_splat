@@ -1,3 +1,6 @@
+# Third-party rendering
+diff-gaussian-rasterization/
+
 # Third-party sub-projects (clone separately)
 map-anything/
 gaussianwm/
