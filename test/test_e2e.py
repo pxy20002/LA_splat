@@ -87,7 +87,7 @@ def main():
     # 4) Gaussian Decoder
     print("\n--- Gaussian Decoder ---")
     with torch.no_grad():
-        gs_out = decoder(anchor_feats.to(device))
+        gs_out = decoder(anchor_feats.to(device), anchors.to(device))
     gaussians = assemble_gaussians(gs_out, anchors.to(device))
     print(f"  Gaussians: {gaussians['means'].shape[0]}")
 
@@ -95,16 +95,15 @@ def main():
     ri = args.view_to_render
     print(f"\n--- Render View {ri} ---")
     gs_gpu = {k: v.to(device) for k, v in gaussians.items()}
-    rendered, depth, alpha = render_view(
+    rendered, depth, _ = render_view(
         gs_gpu, poses_t[ri].to(device), Ks_t[ri].to(device), H, W,
     )
     rendered = rendered.cpu()
     depth = depth.cpu()
-    alpha = alpha.cpu()
     print(f"  Rendered: {list(rendered.shape)}")
     print(f"  Depth:    {list(depth.shape)}")
 
-    # 6) Visualize: GT | Rendered | Depth | Alpha
+    # 6) Visualize: GT | Rendered | Depth
     gt = imgs[ri]
     gt_np = gt.numpy()
     if gt_np.max() > 10:
@@ -114,7 +113,7 @@ def main():
     else:
         gt_disp = np.clip(gt_np, 0, 255).astype(np.uint8)
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
     axes[0].imshow(gt_disp)
     axes[0].set_title("GT Image")
@@ -136,11 +135,6 @@ def main():
     axes[2].set_title(f"Rendered Depth\nmin={d.min():.3f} max={d.max():.3f}")
     axes[2].axis("off")
     plt.colorbar(im_d, ax=axes[2], fraction=0.046)
-
-    a = alpha.squeeze(-1).numpy()
-    axes[3].imshow(a, cmap="gray", vmin=0, vmax=1)
-    axes[3].set_title(f"Alpha\nmax={a.max():.3f}")
-    axes[3].axis("off")
 
     fig.suptitle(f"AnchorSplat E2E — View {ri}  |  {visible}/{args.num_anchors} anchors visible  |  "
                  f"{gaussians['means'].shape[0]} Gaussians", fontsize=12)

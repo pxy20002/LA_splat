@@ -32,7 +32,7 @@ def test_shape():
     decoder = GaussianDecoder(in_dim=64).eval()
     x = torch.randn(1024, 64)  # [N, D_in]
     with torch.no_grad():
-        out = decoder(x)
+        out = decoder(x, torch.randn(x.shape[-2], 3))
 
     check_shape("delta_mu",  out["delta_mu"],  (1024, 4, 3))
     check_shape("opacity",   out["opacity"],   (1024, 4, 1))
@@ -50,7 +50,7 @@ def test_value_ranges():
     decoder = GaussianDecoder(in_dim=64).eval()
     x = torch.randn(256, 64)
     with torch.no_grad():
-        out = decoder(x)
+        out = decoder(x, torch.randn(x.shape[-2], 3))
 
     # opacity in [0, 1]
     op = out["opacity"]
@@ -83,7 +83,7 @@ def test_batch():
     decoder = GaussianDecoder(in_dim=64).eval()
     x = torch.randn(3, 512, 64)  # [B, N, D_in]
     with torch.no_grad():
-        out = decoder(x)
+        out = decoder(x, torch.randn(x.shape[-2], 3))
     check_shape("delta_mu (batch)", out["delta_mu"], (3, 512, 4, 3))
     print("  Result: PASS\n")
 
@@ -95,7 +95,7 @@ def test_gradient():
     print("=" * 60)
     decoder = GaussianDecoder(in_dim=64)
     x = torch.randn(32, 64, requires_grad=True)
-    out = decoder(x)
+    out = decoder(x, torch.randn(x.shape[-2], 3))
     loss = out["opacity"].sum() + out["delta_mu"].sum()
     loss.backward()
     ok = x.grad is not None and (x.grad.abs().sum() > 0)
@@ -156,7 +156,7 @@ def test_end_to_end(predictions_path: str):
 
     # 3) Gaussian Decoder
     with torch.no_grad():
-        gaussians = decoder(anchor_feats)
+        gaussians = decoder(anchor_feats, anchors)
 
     for k, v in gaussians.items():
         nz = (v.abs().sum(dim=-1) > 1e-6).float().mean().item() * 100

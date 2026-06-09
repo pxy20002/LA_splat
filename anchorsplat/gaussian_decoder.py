@@ -35,33 +35,35 @@ class TransformerBlock(nn.Module):
 
 class GaussianDecoder(nn.Module):
     """
-    AnchorSplat Gaussian Decoder.
+    AnchorSplat Gaussian Decoder (Eq.8: {F_j, A_j} → Attention → MLP → Gaussians).
 
-    Input:  anchor_features  [N, D_in]   (D_in=64 from module 3)
+    Input:  anchor_features [N, D_in] + anchors [N, 3]
     Output: dict of Gaussian attributes per anchor, each anchor → 4 Gaussians.
 
     Architecture (matching the paper):
-      - Input projection:  Linear(D_in → 640)
-      - 16 × TransformerBlock  (640 dim, 10 heads, mlp_ratio=4)
-      - 2 × single-layer MLP   (640 → 640, ReLU)
+      - Input concatenation:  [feature, anchor_xyz]  (D_in + 3 = 67)
+      - Input projection:     Linear(D_in+3 → 640)
+      - 16 × TransformerBlock (640 dim, 10 heads, mlp_ratio=4)
+      - 2 × single-layer MLP  (640 → 640, ReLU)
       - 5 parallel Linear heads:
           delta_μ  [N, 4, 3]    center offset
           opacity  [N, 4, 1]    α  (sigmoid)
           scale    [N, 4, 3]    s  (exp)
           rotation [N, 4, 4]    r  (L2-normalized quaternion)
-          sh       [N, 4, 3]    spherical harmonics DC (degree=0, raw)
+          sh       [N, 4, 3]    SH DC = RGB (sigmoid)
 
     Parameters: ~84M  (matches paper Table: 84M).
     """
 
     def __init__(self, in_dim: int = 64, hidden_dim: int = 640,
                  num_blocks: int = 16, num_heads: int = 10,
-                 gaussians_per_anchor: int = 4):
+                 gaussians_per_anchor: int = 4, pos_dim: int = 3):
         super().__init__()
         self.gaussians_per_anchor = gaussians_per_anchor
+        self.pos_dim = pos_dim
 
-        # Input projection
-        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        # Input projection: feature + 3D anchor position (Eq.8: {F_j, A_j})
+        self.input_proj = nn.Linear(in_dim + pos_dim, hidden_dim)
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
@@ -87,10 +89,11 @@ class GaussianDecoder(nn.Module):
         # Initialize scale bias so initial scales are reasonable (~0.05)
         nn.init.constant_(self.head_scale.bias, -3.0)  # exp(-3) ≈ 0.05
 
-    def forward(self, x: torch.Tensor) -> dict:
+    def forward(self, x: torch.Tensor, anchors: torch.Tensor = None) -> dict:
         """
         Args:
-            x: [N, D_in] anchor features (batch dimension optional, [B, N, D_in]).
+            x:       [N, D_in] anchor features (or [B, N, D_in]).
+            anchors: [N, 3] 3D anchor positions (or [B, N, 3]). Eq.8: {F_j, A_j}.
 
         Returns:
             dict with keys:
@@ -106,8 +109,18 @@ class GaussianDecoder(nn.Module):
         has_batch = x.dim() == 3
         if not has_batch:
             x = x.unsqueeze(0)  # [1, N, D_in]
+        if anchors is not None:
+            if anchors.dim() == 2:
+                anchors = anchors.unsqueeze(0)  # [1, N, 3]
 
         B = x.shape[0]
+
+        if anchors is not None and anchors.shape[0] == 1 and B > 1:
+            anchors = anchors.expand(B, -1, -1)  # [B, N, 3]
+
+        # Concatenate anchor position (Eq.8: {F_j, A_j})
+        if anchors is not None:
+            x = torch.cat([x, anchors], dim=-1)  # [B, N, D_in + 3]
 
         # Project
         x = self.input_proj(x)  # [B, N, 640]

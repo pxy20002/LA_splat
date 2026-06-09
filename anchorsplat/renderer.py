@@ -51,8 +51,8 @@ def _projection_matrix_from_K(K: torch.Tensor, H: int, W: int,
     proj[1, 1] = 2.0 * znear / (top - bottom)
     proj[0, 2] = (right + left) / (right - left)
     proj[1, 2] = (top + bottom) / (top - bottom)
-    proj[2, 2] = zfar / (zfar - znear)
-    proj[2, 3] = -(zfar * znear) / (zfar - znear)
+    proj[2, 2] = zfar / max(zfar - znear, 1e-8)
+    proj[2, 3] = -(zfar * znear) / max(zfar - znear, 1e-8)
     proj[3, 2] = 1.0
 
     return proj, tanfovx, tanfovy
@@ -93,6 +93,7 @@ def render_view(
     W: int,
     background: torch.Tensor = None,
     scale_modifier: float = 1.0,
+    mvs_depth: torch.Tensor = None,
 ) -> tuple:
     """
     Render a single view via diff-gaussian-rasterization.
@@ -125,13 +126,26 @@ def render_view(
 
     cam_center = camera_pose[:3, 3].to(device)  # world-frame camera center
 
-    proj, tanfovx, tanfovy = _projection_matrix_from_K(K.to(device), H, W)
-    full_proj = proj @ w2c  # [4, 4]
-
     means = torch.nan_to_num(gaussians["means"].to(device), nan=0.0, posinf=1.0, neginf=0.0)
+    # Push Gaussians too close / too far from camera (prevents NaN in rasterizer)
+    to_cam = means - cam_center.unsqueeze(0)          # [N, 3]
+    dist = to_cam.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    safe_dist = dist.clamp(min=0.05, max=500.0)      # 5cm ~ 500m safe range
+    means = cam_center.unsqueeze(0) + to_cam * (safe_dist / dist)
+
+    # Auto-detect scene depth range for this view
+    dist_to_cam = (means - cam_center.unsqueeze(0)).norm(dim=1)
+    zfar_dynamic = max(dist_to_cam.max().item() * 2.0, 10.0)  # at least 10m
+
+    proj, tanfovx, tanfovy = _projection_matrix_from_K(K.to(device), H, W, znear=0.01, zfar=zfar_dynamic)
+    full_proj = proj @ w2c  # [4, 4]
     quats = torch.nan_to_num(gaussians["quats"].to(device), nan=0.0, posinf=1.0, neginf=0.0)
-    scales_g = torch.nan_to_num(gaussians["scales"].to(device), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=1e-8, max=100.0)
-    opacities_g = torch.nan_to_num(gaussians["opacities"].to(device), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0).squeeze(-1)  # [N]
+    scales_g = torch.nan_to_num(gaussians["scales"].to(device), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=1e-8)
+    # Adaptive scale clamp: max 10% of scene extent (matches original 3DGS pruning)
+    scene_extent = (means.max(dim=0).values - means.min(dim=0).values).norm().item()
+    max_scale = max(scene_extent * 0.1, 0.01)  # at least 1cm
+    scales_g = scales_g.clamp(max=max_scale)
+    opacities_g = torch.nan_to_num(gaussians["opacities"].to(device), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)  # [N, 1]
     colors_g = torch.nan_to_num(gaussians["colors"].to(device), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     zeros2d = torch.zeros(means.shape[0], 2, device=device)
 
@@ -151,28 +165,13 @@ def render_view(
     rendered = rendered.permute(1, 2, 0)  # [H, W, 3]
     rendered = torch.nan_to_num(rendered, nan=0.0, posinf=1.0, neginf=0.0)
 
-    # --- Alpha pass: white Gaussians on black → R channel = accumulated alpha ---
-    white = torch.ones_like(colors_g)
-    black = torch.zeros(3, device=device)
-    alpha_settings = GaussianRasterizationSettings(
-        image_height=H, image_width=W,
-        tanfovx=tanfovx, tanfovy=tanfovy, bg=black,
-        scale_modifier=scale_modifier,
-        viewmatrix=w2c.transpose(0, 1), projmatrix=full_proj.transpose(0, 1),
-        sh_degree=0, campos=cam_center, prefiltered=False, debug=False,
-    )
-    alpha_raw, _ = GaussianRasterizer(alpha_settings)(
-        means3D=means, means2D=zeros2d, shs=None,
-        colors_precomp=white, opacities=opacities_g,
-        scales=scales_g, rotations=quats, cov3D_precomp=None,
-    )
-    alpha = alpha_raw[0:1].permute(1, 2, 0)  # [H, W, 1]
-
-    # --- Depth pass: depth as color on black → divide by alpha for clean depth ---
-    depth_val = means[:, 2:3].expand(-1, 3)
+    # --- Depth pass: depth as color on black → alpha-composited depth ---
+    #    Scaffold-GS / standard 3DGS use the same rasterizer, but extra depth pass
+    #    is needed because AnchorSplat paper uses depth supervision.
+    depth_val = (means - cam_center.unsqueeze(0)).norm(dim=1, keepdim=True).expand(-1, 3)  # ray distance
     depth_settings = GaussianRasterizationSettings(
         image_height=H, image_width=W,
-        tanfovx=tanfovx, tanfovy=tanfovy, bg=black,
+        tanfovx=tanfovx, tanfovy=tanfovy, bg=torch.zeros(3, device=device),
         scale_modifier=scale_modifier,
         viewmatrix=w2c.transpose(0, 1), projmatrix=full_proj.transpose(0, 1),
         sh_degree=0, campos=cam_center, prefiltered=False, debug=False,
@@ -183,10 +182,39 @@ def render_view(
         scales=scales_g, rotations=quats, cov3D_precomp=None,
     )
     depth = depth_raw[0:1].permute(1, 2, 0)  # [H, W, 1]
-    depth = depth / alpha.clamp(min=1e-8)
     depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
 
-    return rendered, depth, alpha
+    # Blend MVS depth into uncovered pixels (removes "0 vs GT" noise floor in L2)
+    if mvs_depth is not None:
+        mvs = mvs_depth.to(device).reshape(H, W, 1)  # force [H, W, 1]
+        uncovered = depth < 0.01  # black bg = no Gaussian hit
+        depth[uncovered] = mvs[uncovered]
+
+    return rendered, depth, None
+
+
+_LPIPS_FN = None
+
+
+def _get_lpips(device):
+    """Lazy-load LPIPS once (avoids re-creating the model on every call)."""
+    global _LPIPS_FN
+    if _LPIPS_FN is None:
+        import os
+        os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+        from lpips import LPIPS
+        _LPIPS_FN = LPIPS(net="vgg").to(device)
+    return _LPIPS_FN
+
+
+DEFAULT_LOSS_WEIGHTS = {
+    "lambda_I": 200.0,
+    "gamma_ssim": 0.2,
+    "gamma_lpips": 0.2,
+    "lambda_D": 100.0,
+    "lambda_alpha": 0.1,
+    "lambda_s": 1e4,
+}
 
 
 def compute_loss(
@@ -206,14 +234,7 @@ def compute_loss(
     where l_I = L1 + γ_SSIM·(1-SSIM) + γ_LPIPS·LPIPS
     """
     if weights is None:
-        weights = {
-            "lambda_I": 200.0,
-            "gamma_ssim": 0.2,
-            "gamma_lpips": 0.2,
-            "lambda_D": 100.0,
-            "lambda_alpha": 0.1,
-            "lambda_s": 1e4,
-        }
+        weights = DEFAULT_LOSS_WEIGHTS
 
     rendered = rendered.permute(2, 0, 1).unsqueeze(0)   # [1, 3, H, W]
     gt = gt_image.permute(2, 0, 1).unsqueeze(0)          # [1, 3, H, W]
@@ -225,11 +246,11 @@ def compute_loss(
     loss_I = l1 + weights["gamma_ssim"] * ssim_loss
 
     try:
-        from lpips import LPIPS
-        lpips_fn = LPIPS(net="vgg").to(rendered.device)
+        lpips_fn = _get_lpips(rendered.device)
         lpips_val = lpips_fn(rendered.clamp(0, 1), gt.clamp(0, 1)).mean()
         loss_I = loss_I + weights["gamma_lpips"] * lpips_val
     except ImportError:
+        print("\n*** WARNING: lpips not installed! ***\n")
         lpips_val = torch.tensor(0.0, device=rendered.device)
 
     loss_D = F.l1_loss(rendered_depth, gt_depth)

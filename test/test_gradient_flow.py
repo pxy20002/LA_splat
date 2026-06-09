@@ -108,7 +108,7 @@ def main():
 
     # 4c) Gaussian Decoder (trainable)
     decoder = GaussianDecoder(in_dim=64).train().to(device)
-    gs_out = decoder(anchor_feats)
+    gs_out = decoder(anchor_feats, anchors)
     print(f"  Decoder output: delta_mu={list(gs_out['delta_mu'].shape)}")
 
     # 4d) Assemble + Render

@@ -20,9 +20,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="Evaluate a trained AnchorSplat checkpoint.")
     p.add_argument("--ckpt", type=str, required=True,
                    help="Path to checkpoint .pt file.")
-    p.add_argument("--pt_path", type=str,
-                   default="datasets/mapanything_predictions_truck_v4.pt")
-    p.add_argument("--num_anchors", type=int, default=512)
+    inp = p.add_mutually_exclusive_group(required=False)
+    inp.add_argument("--image_dir", type=str, default=None,
+                     help="Folder of input images.")
+    inp.add_argument("--pt_path", type=str, default=None,
+                     help="Cached .pt prediction file.")
+    p.add_argument("--num_anchors", type=int, default=256)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--save_path", type=str, default=None,
                    help="Save comparison image to this path.")
@@ -43,12 +46,14 @@ def main():
     print(f"  Final loss: {ckpt['losses'][-1]:.2f}")
 
     # ── Load dataset ─────────────────────────────────────────────────
+    if args.image_dir is None and args.pt_path is None:
+        args.pt_path = "datasets/mapanything_predictions_truck_v4.pt"
     dataset = SceneDataset(
-        [str(Path(args.pt_path).resolve())],
+        image_dir=args.image_dir, pt_path=args.pt_path,
         num_anchors=args.num_anchors, device=device,
     )
-    scene = dataset.get_scene(0)
-    H, W = scene["H"], scene["W"]
+    batch = dataset.get_batch()
+    H, W = batch["H"], batch["W"]
 
     # ── Build models, load weights ──────────────────────────────────
     unet = LightweightUNet(in_channels=10, out_channels=64).eval().to(device)
@@ -57,63 +62,85 @@ def main():
     decoder.load_state_dict(ckpt["decoder"])
 
     # ── Full pipeline ───────────────────────────────────────────────
-    u_input = scene["unet_inputs"].to(device)  # [V, 10, H, W]
-    anchors = scene["anchors"].to(device)
+    u_input = batch["u_input"]
+    anchors = batch["anchors"]
+    depths_t = batch["depths"]
+    poses_t = batch["poses"]
+    Ks_t = batch["Ks"]
 
     with torch.no_grad():
         features = unet(u_input)  # [V, 64, H, W]
-
-    depths_t = torch.stack(scene["depths"], dim=0).squeeze(-1).unsqueeze(1).to(device)
-    poses_t = torch.stack(scene["poses"], dim=0).to(device)
-    Ks_t = torch.stack(scene["Ks"], dim=0).to(device)
 
     anchor_feats, vis = project_and_aggregate(
         anchors, features, depths_t, poses_t, Ks_t,
     )
 
     with torch.no_grad():
-        gs_out = decoder(anchor_feats)
+        gs_out = decoder(anchor_feats, anchors)
     gaussians = assemble_gaussians(gs_out, anchors)
 
     # ── Render selected views ───────────────────────────────────────
-    view_indices = args.views if args.views is not None else list(range(scene["n_views"]))
+    view_indices = args.views if args.views is not None else list(range(dataset.n_views))
     n_v = len(view_indices)
 
-    fig, axes = plt.subplots(n_v, 3, figsize=(15, 4 * n_v))
+    fig, axes = plt.subplots(n_v, 5, figsize=(21, 4 * n_v),
+                              gridspec_kw={"width_ratios": [1, 1, 1, 1, 0.08]})
     if n_v == 1:
         axes = axes.reshape(1, -1)
 
-    for row, vi in enumerate(view_indices):
+    for row in range(n_v):
+        axes[row, 4].axis("off")  # hide colorbar placeholder
+
+    # First pass: collect all depth values for unified colorbar
+    all_d_vals, all_gt_vals = [], []
+    render_results = []
+    for vi in view_indices:
         with torch.no_grad():
             rendered, depth, _ = render_view(
                 gaussians, poses_t[vi], Ks_t[vi], H, W,
             )
+        d_np = depth.cpu().squeeze(-1).numpy()
+        gt_d = batch["depths"].squeeze(1)[vi].cpu().numpy()
+        all_d_vals.append(d_np)
+        all_gt_vals.append(gt_d)
+        render_results.append((vi, rendered, d_np, gt_d))
 
-        # GT
-        gt = scene["imgs"][vi].numpy()
+    vmin = min(np.min(d) for d in all_d_vals + all_gt_vals)
+    vmax = max(np.max(d) for d in all_d_vals + all_gt_vals)
+
+    for row, (vi, rendered, d_np, gt_d) in enumerate(render_results):
+        # 1) GT RGB
+        gt = batch["gt_imgs"][vi].cpu().numpy()
         gt_disp = (np.clip(gt, 0, 1) * 255).astype(np.uint8) if gt.max() <= 1.0 else np.clip(gt, 0, 255).astype(np.uint8)
         axes[row, 0].imshow(gt_disp)
         axes[row, 0].set_title(f"View {vi} — GT")
         axes[row, 0].axis("off")
 
-        # Rendered
+        # 2) Rendered RGB
         r_np = rendered.cpu().numpy()
         r_disp = np.clip(r_np, 0, 1) if r_np.max() <= 1.1 else np.clip(r_np / 255., 0, 1)
         axes[row, 1].imshow(r_disp)
         axes[row, 1].set_title("Rendered")
         axes[row, 1].axis("off")
 
-        # Depth
-        d_np = depth.cpu().squeeze(-1).numpy()
-        im = axes[row, 2].imshow(d_np, cmap="jet")
-        axes[row, 2].set_title(f"Depth  [{d_np.min():.2f}, {d_np.max():.2f}]")
+        # 3) GT Depth (MVS)
+        im2 = axes[row, 2].imshow(gt_d, cmap="inferno", vmin=vmin, vmax=vmax)
+        axes[row, 2].set_title("GT Depth")
         axes[row, 2].axis("off")
-        plt.colorbar(im, ax=axes[row, 2], fraction=0.046)
 
-    # Loss curve (small inset or separate)
-    fig.suptitle(f"AnchorSplat -- step {ckpt['step'] + 1}  |  "
-                 f"{n_v} views  |  {gaussians['means'].shape[0]} Gaussians",
-                 fontsize=12)
+        # 4) Rendered Depth
+        im1 = axes[row, 3].imshow(d_np, cmap="inferno", vmin=vmin, vmax=vmax)
+        axes[row, 3].set_title("Rendered Depth")
+        axes[row, 3].axis("off")
+        # Colorbar in dedicated 5th column
+        cbar = fig.colorbar(im1, cax=axes[row, 4])
+        cbar.set_ticks([vmin, vmax])
+        cbar.set_ticklabels([f"{vmin:.1f}", f"{vmax:.1f}"])
+
+    fig.suptitle(f"AnchorSplat — step {ckpt['step'] + 1}  |  "
+                 f"{n_v} views  |  {gaussians['means'].shape[0]} Gaussians  |  "
+                 f"Depth [{vmin:.2f}, {vmax:.2f}]",
+                 fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
 
     if args.save_path:

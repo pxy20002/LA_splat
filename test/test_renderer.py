@@ -24,14 +24,14 @@ def test_assemble():
     decoder = GaussianDecoder(in_dim=64).eval()
     x = torch.randn(N, 64)
     with torch.no_grad():
-        out = decoder(x)
+        out = decoder(x, torch.randn(x.shape[-2], 3))
     anchors = torch.randn(N, 3)
     g = assemble_gaussians(out, anchors)
 
     assert g["means"].shape == (N * 4, 3)
     assert g["quats"].shape == (N * 4, 4)
     assert g["scales"].shape == (N * 4, 3)
-    assert g["opacities"].shape == (N * 4,)
+    assert g["opacities"].shape == (N * 4, 1)
     assert g["colors"].shape == (N * 4, 3)
     # Means should be near anchors (offsets are small initially)
     anchor_centers = anchors.unsqueeze(1).expand(N, 4, 3).reshape(N * 4, 3)
@@ -100,7 +100,7 @@ def test_end_to_end(predictions_path: str):
 
     anchor_feats, vis = project_and_aggregate(anchors, fmaps_t, dmaps_t, poses_t, Ks_t)
     with torch.no_grad():
-        gs_out = decoder(anchor_feats)
+        gs_out = decoder(anchor_feats, anchors)
 
     gaussians = assemble_gaussians(gs_out, anchors)
     print(f"  Gaussians: {gaussians['means'].shape[0]} total")
@@ -132,7 +132,7 @@ def test_render():
     gaussians = {"means": means, "quats": quats, "scales": scales,
                  "opacities": opacities, "colors": colors}
 
-    rendered, rendered_depth, alpha = render_view(gaussians, viewmat, K, H, W)
+    rendered, rendered_depth, _ = render_view(gaussians, viewmat, K, H, W)
     losses = compute_loss(rendered, rendered_depth, rendered, rendered_depth,
                           opacities, scales)
     print(f"  Rendered: {list(rendered.shape)}")

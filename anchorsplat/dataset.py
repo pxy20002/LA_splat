@@ -1,7 +1,7 @@
-"""Scene dataset: loads .pt predictions, precomputes anchors, builds training batches."""
+"""Scene dataset: loads predictions from images (MapAnything) or cached .pt, precomputes anchors."""
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 
@@ -28,113 +28,132 @@ def _build_unet_inputs_for_views(predictions: list) -> list:
     return inputs
 
 
+def _predictions_from_images(image_dir: str, device: str) -> list:
+    """Run MapAnything on a folder of images. Cache result as .pt for later reuse."""
+    from mapanything.models import MapAnything
+    from mapanything.utils.image import load_images
+
+    print(f"Running MapAnything on: {image_dir}")
+    model = MapAnything.from_pretrained("facebook/map-anything").to(device)
+    model.eval()
+
+    views = load_images(image_dir)
+    n_images = len(views)
+    print(f"  Loaded {n_images} images")
+
+    # Check for cache with image count in filename
+    cache_path = Path(image_dir) / f"mapanything_v{n_images}.pt"
+    if cache_path.exists():
+        print(f"Loading cached: {cache_path}")
+        return _predictions_from_pt(str(cache_path))
+
+    for v in views:
+        v["img"] = v["img"].to(device)
+
+    with torch.no_grad():
+        predictions = model.infer(
+            views,
+            memory_efficient_inference=True,
+            use_amp=(device == "cuda"),
+            amp_dtype="bf16",
+            apply_mask=True,
+            mask_edges=True,
+        )
+    print(f"  MapAnything done: {len(predictions)} views")
+
+    # Save cache
+    torch.save({"predictions": predictions}, cache_path)
+    print(f"  Cached → {cache_path}")
+    return predictions
+
+
+def _predictions_from_pt(pt_path: str) -> list:
+    """Load cached predictions from a .pt file."""
+    print(f"Loading cached: {pt_path}")
+    data = torch.load(pt_path, map_location="cpu", weights_only=False)
+    return data["predictions"]
+
+
 class SceneDataset:
     """
-    Wraps one or more .pt prediction files as a training dataset.
+    Wraps a scene (from images or cached .pt) as a fixed training dataset.
 
-    Precomputes anchors (frozen) and provides pre-built U-Net input tensors
-    so the training loop doesn't need to repeat geometry computations.
+    All views are used every step — anchors and training data come from
+    the same source, avoiding the anchor/view inconsistency issue.
     """
 
     def __init__(
         self,
-        pt_paths: List[str],
+        image_dir: str = None,
+        pt_path: str = None,
         num_anchors: int = 1024,
         device: str = "cuda",
     ):
         self.device = device
         self.num_anchors = num_anchors
 
-        # Per-scene storage
-        self.scenes = []  # list of dicts
+        if image_dir is not None:
+            predictions = _predictions_from_images(image_dir, device)
+        elif pt_path is not None:
+            predictions = _predictions_from_pt(pt_path)
+        else:
+            raise ValueError("Must provide --image_dir or --pt_path")
 
-        for pt_path in pt_paths:
-            print(f"Loading: {pt_path}")
-            data = torch.load(pt_path, map_location="cpu", weights_only=False)
-            predictions = data["predictions"]
-            n_views = len(predictions)
+        n_views = len(predictions)
+        print(f"  Views: {n_views}")
 
-            # Precompute anchors (CPU, frozen)
-            print(f"  Precomputing anchors ({num_anchors}) for {n_views} views...")
-            result = AnchorPredictor.from_predictions(
-                predictions, num_anchors=num_anchors
-            )
-            anchors = result["anchors"]  # [N, 3]
+        # Precompute anchors (CPU, frozen) — from ALL views
+        print(f"  Precomputing anchors ({num_anchors})...")
+        result = AnchorPredictor.from_predictions(
+            predictions, num_anchors=num_anchors
+        )
+        anchors = result["anchors"]  # [N, 3]
 
-            # Precompute U-Net inputs
-            print(f"  Building U-Net inputs...")
-            unet_inputs = _build_unet_inputs_for_views(predictions)
-            # Stack into precomputed tensor [V, 10, H, W]
-            unet_inputs_t = torch.stack(unet_inputs, dim=0)
+        # Precompute U-Net inputs
+        print(f"  Building U-Net inputs...")
+        unet_in = _build_unet_inputs_for_views(predictions)
+        unet_inputs_t = torch.stack(unet_in, dim=0)  # [V, 10, H, W]
 
-            # Extract per-view data
-            imgs = []
-            depths = []
-            poses = []
-            Ks = []
-            for pred in predictions:
-                imgs.append(pred["img_no_norm"].squeeze(0))              # [H, W, 3]
-                depths.append(pred["depth_along_ray"].squeeze(0))       # [H, W, 1]
-                poses.append(pred["camera_poses"].squeeze(0))             # [4, 4]
-                Ks.append(pred["intrinsics"].squeeze(0))                 # [3, 3]
+        # Extract per-view data
+        imgs, depths, poses, Ks = [], [], [], []
+        for pred in predictions:
+            imgs.append(pred["img_no_norm"].squeeze(0))              # [H, W, 3]
+            depths.append(pred["depth_along_ray"].squeeze(0))       # [H, W, 1]
+            poses.append(pred["camera_poses"].squeeze(0))             # [4, 4]
+            Ks.append(pred["intrinsics"].squeeze(0))                 # [3, 3]
 
-            H, W = imgs[0].shape[0], imgs[0].shape[1]
+        H, W = imgs[0].shape[0], imgs[0].shape[1]
+        self.n_views = n_views
 
-            self.scenes.append({
-                "anchors": anchors,
-                "unet_inputs": unet_inputs_t,    # [V, 10, H, W]
-                "imgs": imgs,                     # list of [H, W, 3]
-                "depths": depths,                # list of [H, W, 1]
-                "poses": poses,                   # list of [4, 4]
-                "Ks": Ks,                        # list of [3, 3]
-                "n_views": n_views,
-                "H": H,
-                "W": W,
-            })
-
-    def get_scene(self, scene_idx: int = 0) -> dict:
-        """Return a scene dict with all views available for sampling."""
-        return self.scenes[scene_idx]
-
-    def sample_views(self, scene_dict: dict, num_views: int, device: str = None):
-        """
-        Randomly sample `num_views` from a scene and return a training batch.
-
-        Returns a dict with keys:
-          u_input:  [V, 10, H, W] on device
-          depths:   [V, 1, H, W]  on device
-          poses:    [V, 4, 4]     on device
-          Ks:       [V, 3, 3]     on device
-          gt_imgs:  [V, H, W, 3]  on device
-          anchors:  [N, 3]        on device
-          H, W:     int
-        """
-        if device is None:
-            device = self.device
-
-        n = scene_dict["n_views"]
-        indices = torch.randperm(n)[:num_views].tolist()
-
-        unet_in = scene_dict["unet_inputs"][indices].to(device)  # [V, 10, H, W]
-
-        depths = torch.stack([scene_dict["depths"][i] for i in indices], dim=0)
-        depths = depths.squeeze(-1).unsqueeze(1).to(device)  # [V, 1, H, W]
-
-        poses = torch.stack([scene_dict["poses"][i] for i in indices], dim=0).to(device)
-        Ks = torch.stack([scene_dict["Ks"][i] for i in indices], dim=0).to(device)
-        imgs = torch.stack([scene_dict["imgs"][i] for i in indices], dim=0).to(device)
-
-        return {
-            "u_input": unet_in,
-            "depths": depths,
-            "poses": poses,
-            "Ks": Ks,
-            "gt_imgs": imgs,
-            "anchors": scene_dict["anchors"].to(device),
-            "H": scene_dict["H"],
-            "W": scene_dict["W"],
-            "indices": indices,
+        self._scene = {
+            "anchors": anchors,
+            "unet_inputs": unet_inputs_t,    # [V, 10, H, W]
+            "imgs": imgs,                     # list of [H, W, 3]
+            "depths": depths,                # list of [H, W, 1]
+            "poses": poses,                   # list of [4, 4]
+            "Ks": Ks,                        # list of [3, 3]
+            "n_views": n_views,
+            "H": H, "W": W,
         }
 
-    def __len__(self):
-        return len(self.scenes)
+    def get_batch(self, device: str = None) -> dict:
+        """Return the full training batch (all views, every step)."""
+        if device is None:
+            device = self.device
+        s = self._scene
+        V, H, W = s["n_views"], s["H"], s["W"]
+
+        depths = torch.stack(s["depths"], dim=0).squeeze(-1).unsqueeze(1).to(device)
+        poses = torch.stack(s["poses"], dim=0).to(device)
+        Ks = torch.stack(s["Ks"], dim=0).to(device)
+        imgs = torch.stack(s["imgs"], dim=0).to(device)
+
+        return {
+            "u_input": s["unet_inputs"].to(device),  # [V, 10, H, W]
+            "depths": depths,                         # [V, 1, H, W]
+            "poses": poses,                           # [V, 4, 4]
+            "Ks": Ks,                                # [V, 3, 3]
+            "gt_imgs": imgs,                          # [V, H, W, 3]
+            "anchors": s["anchors"].to(device),       # [N, 3]
+            "H": H, "W": W,
+        }
