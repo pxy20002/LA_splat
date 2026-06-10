@@ -1,0 +1,7 @@
+torch>=2.0.0
+torchvision
+numpy
+matplotlib
+open3d
+lpips
+diff-gaussian-rasterization
